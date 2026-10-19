@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Executive Desk</string>
+    <string name="title_activity_main">Executive Desk</string>
+    <string name="package_name">com.cemmats.executivedesk</string>
+    <string name="custom_url_scheme">com.cemmats.executivedesk</string>
+</resources>

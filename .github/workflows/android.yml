@@ -1,0 +1,91 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install and build web app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.EDESK_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/executive-desk.jks"
+            echo "EDESK_KEYSTORE_PATH=$RUNNER_TEMP/executive-desk.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing key secret found; the APK will not be installable as an update."
+          fi
+
+      - name: Build APK
+        env:
+          EDESK_KEYSTORE_PASSWORD: ${{ secrets.EDESK_KEYSTORE_PASSWORD }}
+          EDESK_KEY_PASSWORD: ${{ secrets.EDESK_KEYSTORE_PASSWORD }}
+          EDESK_KEY_ALIAS: executivedesk
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          V=1.0.${{ github.run_number }}
+          if [ -n "$EDESK_KEYSTORE_PATH" ]; then
+            ./gradlew assembleRelease --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$V
+            cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/ExecutiveDesk-$V.apk"
+            echo "KIND=release" >> "$GITHUB_ENV"
+          else
+            ./gradlew assembleDebug --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$V
+            cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/ExecutiveDesk-$V-TEST.apk"
+            echo "KIND=test" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ExecutiveDesk-APK
+          path: ExecutiveDesk-*.apk
+
+      - name: Release notes
+        run: |
+          V=1.0.${{ github.run_number }}
+          if [ "$KIND" = "test" ]; then
+            echo "REL_TAG=v$V-test" >> "$GITHUB_ENV"
+            echo "REL_NAME=Executive Desk $V (TEST build, temporary key)" >> "$GITHUB_ENV"
+            echo "REL_PRE=true" >> "$GITHUB_ENV"
+            echo "TEST build signed with a temporary key. Fine for trying the app, but later versions will NOT install over it: back up, uninstall, install the real release, then restore." > notes.md
+          else
+            echo "REL_TAG=v$V" >> "$GITHUB_ENV"
+            echo "REL_NAME=Executive Desk $V" >> "$GITHUB_ENV"
+            echo "REL_PRE=false" >> "$GITHUB_ENV"
+            echo "Install on Android: download the .apk below, open it and allow installs from this source. Installing over an earlier version keeps all records." > notes.md
+          fi
+
+      - name: Publish as a release (easy phone download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.REL_TAG }}
+          name: ${{ env.REL_NAME }}
+          prerelease: ${{ env.REL_PRE }}
+          body_path: notes.md
+          files: ExecutiveDesk-*.apk

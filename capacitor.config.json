@@ -1,0 +1,10 @@
+{
+  "appId": "com.cemmats.executivedesk",
+  "appName": "Executive Desk",
+  "webDir": "www",
+  "android": { "backgroundColor": "#13233d" },
+  "plugins": {
+    "SystemBars": { "insetsHandling": "css", "style": "DARK" },
+    "LocalNotifications": { "smallIcon": "ic_stat_desk", "iconColor": "#d9862f" }
+  }
+}
