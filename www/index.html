@@ -10,12 +10,13 @@
 <body>
 <div class="app">
   <aside class="rail">
-    <div class="brand"><small>CEMMATS · EDSA</small><b>Executive Desk</b><span>Lorna Marie Sowa · Office of the MD</span></div>
+    <div class="brand"><small>CEMMATS · EDSA</small><b>Executive Desk</b><span>Lorna Marie Sowa · Office of the MD</span><span id="syncState" class="syncstate"></span></div>
     <nav class="nav" id="nav" aria-label="Tools"></nav>
   </aside>
   <main id="main"><div class="empty"><b>Loading your desk…</b></div></main>
 </div>
 <input type="file" id="restoreFile" accept="application/json,.json" hidden>
+<script src="firebase-config.js"></script>
 <script src="native.js"></script>
 <script src="app.js"></script>
 </body>

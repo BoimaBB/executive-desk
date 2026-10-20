@@ -184,3 +184,8 @@ body{padding-top:var(--safe-area-inset-top,env(safe-area-inset-top,0px));padding
   h1{font-size:22px}
   .tlrow{grid-template-columns:130px minmax(0,1fr)}
 }
+.syncstate{display:block;margin-top:8px}
+.syncstate .pill{font-size:11.5px}
+@media (max-width:860px){.app{grid-template-rows:auto 1fr}}
+body.signin .nav{display:none}
+body.signin .rail{min-height:calc(var(--safe-area-inset-top,0px) + 8px)}

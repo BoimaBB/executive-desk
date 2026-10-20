@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android + Windows
 
 on:
   push:
@@ -8,33 +8,32 @@ on:
 permissions:
   contents: write
 
+env:
+  APP_VERSION: 2.0.${{ github.run_number }}
+
 jobs:
-  build:
+  android:
     runs-on: ubuntu-24.04
+    outputs:
+      kind: ${{ steps.build.outputs.kind }}
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
-
       - name: Check Android SDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" > /dev/null
-
       - name: Install and build web app
         run: |
           npm ci
           npm run build
-
       - name: Restore signing key
         env:
           KEYSTORE_B64: ${{ secrets.EDESK_KEYSTORE_B64 }}
@@ -42,11 +41,9 @@ jobs:
           if [ -n "$KEYSTORE_B64" ]; then
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/executive-desk.jks"
             echo "EDESK_KEYSTORE_PATH=$RUNNER_TEMP/executive-desk.jks" >> "$GITHUB_ENV"
-          else
-            echo "::warning::No signing key secret found; the APK will not be installable as an update."
           fi
-
       - name: Build APK
+        id: build
         env:
           EDESK_KEYSTORE_PASSWORD: ${{ secrets.EDESK_KEYSTORE_PASSWORD }}
           EDESK_KEY_PASSWORD: ${{ secrets.EDESK_KEYSTORE_PASSWORD }}
@@ -54,42 +51,78 @@ jobs:
         working-directory: android
         run: |
           chmod +x gradlew
-          V=1.0.${{ github.run_number }}
+          mkdir -p "$GITHUB_WORKSPACE/out"
           if [ -n "$EDESK_KEYSTORE_PATH" ]; then
-            ./gradlew assembleRelease --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$V
-            cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/ExecutiveDesk-$V.apk"
-            echo "KIND=release" >> "$GITHUB_ENV"
+            ./gradlew assembleRelease --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$APP_VERSION
+            cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/out/ExecutiveDesk-$APP_VERSION-android.apk"
+            echo "kind=release" >> "$GITHUB_OUTPUT"
           else
-            ./gradlew assembleDebug --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$V
-            cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/ExecutiveDesk-$V-TEST.apk"
-            echo "KIND=test" >> "$GITHUB_ENV"
+            ./gradlew assembleDebug --no-daemon -PversionCode=${{ github.run_number }} -PversionName=$APP_VERSION
+            cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/out/ExecutiveDesk-$APP_VERSION-android-TEST.apk"
+            echo "kind=test" >> "$GITHUB_OUTPUT"
           fi
-
       - uses: actions/upload-artifact@v4
         with:
-          name: ExecutiveDesk-APK
-          path: ExecutiveDesk-*.apk
+          name: android
+          path: out/*.apk
 
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install and bundle web app
+        shell: bash
+        run: |
+          npm ci
+          npm run bundle
+      - name: Build Windows installer
+        shell: bash
+        run: |
+          npx tauri build --config "{\"version\":\"$APP_VERSION\"}"
+          mkdir -p out
+          cp src-tauri/target/release/bundle/nsis/*-setup.exe "out/ExecutiveDesk-$APP_VERSION-windows-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*.exe
+
+  release:
+    needs: [android, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
       - name: Release notes
         run: |
-          V=1.0.${{ github.run_number }}
-          if [ "$KIND" = "test" ]; then
-            echo "REL_TAG=v$V-test" >> "$GITHUB_ENV"
-            echo "REL_NAME=Executive Desk $V (TEST build, temporary key)" >> "$GITHUB_ENV"
-            echo "REL_PRE=true" >> "$GITHUB_ENV"
-            echo "TEST build signed with a temporary key. Fine for trying the app, but later versions will NOT install over it: back up, uninstall, install the real release, then restore." > notes.md
+          if [ "${{ needs.android.outputs.kind }}" = "test" ]; then
+            echo "REL_TAG=v$APP_VERSION-test" >> "$GITHUB_ENV"; echo "REL_PRE=true" >> "$GITHUB_ENV"
+            echo "REL_NAME=Executive Desk $APP_VERSION (TEST)" >> "$GITHUB_ENV"
           else
-            echo "REL_TAG=v$V" >> "$GITHUB_ENV"
-            echo "REL_NAME=Executive Desk $V" >> "$GITHUB_ENV"
-            echo "REL_PRE=false" >> "$GITHUB_ENV"
-            echo "Install on Android: download the .apk below, open it and allow installs from this source. Installing over an earlier version keeps all records." > notes.md
+            echo "REL_TAG=v$APP_VERSION" >> "$GITHUB_ENV"; echo "REL_PRE=false" >> "$GITHUB_ENV"
+            echo "REL_NAME=Executive Desk $APP_VERSION" >> "$GITHUB_ENV"
           fi
+          cat > notes.md <<'NOTES'
+          **Android:** download the `-android.apk` file on the phone, open it and install. It installs over earlier versions and keeps records.
 
-      - name: Publish as a release (easy phone download)
-        uses: softprops/action-gh-release@v2
+          **Windows 11:** download the `-windows-setup.exe` file and run it. If Windows shows "Windows protected your PC", click **More info → Run anyway** (the installer is not commercially signed). Updating: run the newer setup file; records are kept.
+
+          Both apps sign in with the same desk account and share the same records.
+          NOTES
+          sed -i 's/^          //' notes.md
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.REL_TAG }}
           name: ${{ env.REL_NAME }}
           prerelease: ${{ env.REL_PRE }}
           body_path: notes.md
-          files: ExecutiveDesk-*.apk
+          files: out/*

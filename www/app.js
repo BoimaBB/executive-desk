@@ -172,48 +172,113 @@ function ready(r){const opts=TOOLS[6].fields.find(f=>f.k==="checklist").opts;ret
 function statusPill(s){const m={"Done":"ok","Delivered":"ok","Posted":"ok","Reconciled":"ok","Completed":"ok","Approved":"ok","Receipt filed":"ok","Booked":"info","Followed up":"info","Researching":"info","Brief drafted":"info","Drafted":"info","In progress":"info","Travelling":"acc","Awaiting reply":"warn","Awaiting MD approval":"warn","Pending":"warn"};return`<span class="pill ${m[s]||""}">${esc(s)}</span>`}
 function dueCell(d,done){if(!d)return'<span class="sub">No date</span>';const n=daysTo(d);let t=fmtD(d),c="";if(!done){if(n<0){c="bad";t+=` · ${-n}d overdue`}else if(n===0){c="warn";t+=" · today"}else if(n<=7){c="warn";t+=` · in ${n}d`}}return c?`<span class="pill ${c}">${esc(t)}</span>`:esc(t)}
 
-/* ---------- data layer: everything is stored on this phone ---------- */
-// Native app: Capacitor Preferences (Android SharedPreferences, included in Android's own app backup).
-// Browser (testing only): localStorage.
+/* ---------- data layer ---------- */
+// Signed in (normal use): records live in Firebase Firestore under users/{uid}/..., with a full
+// offline copy on the device, so phone and computer stay in step and work without internet.
+// Not signed in / "use on this device only": records stay on this device (Android Preferences or localStorage).
 const store={};[...TOOLS.map(t=>t.id),"actions"].forEach(k=>store[k]=[]);
-const N=window.Native||{isNative:false};
-const DATA_KEY="eadesk.data.v1",SET_KEY="eadesk.settings.v1";
+const N=window.Native||{isNative:false,platform:"web"};
+const S=window.Sync||{enabled:false};
+const DATA_KEY="eadesk.data.v1",SET_KEY="eadesk.settings.v1",LOCAL_ONLY_KEY="eadesk.localonly";
 let db=null,sample=null,downloads=true,canWrite=true,loaded=false;
+let mode="local",cloudUser=null,syncState={online:navigator.onLine,pending:false},localData=null;
 let settings={remind:true,daysBefore:1,hour:8,minutesBefore:30,backupEvery:7,lastBackup:""};
 let view=(()=>{try{return localStorage.getItem("eadesk.view")||"overview"}catch(e){return"overview"}})();
 let editing=null,editingAction=null,filters={q:"",month:todayISO().slice(0,7),range:"upcoming"},confirmDel=null;
 let tl={span:"3",area:"all",open:true};
+const DEVICE=N.platform==="android"?"phone":N.platform==="windows"?"computer":"device";
 
 async function kvGet(k){try{if(N.isNative){const{value}=await N.Preferences.get({key:k});return value}return localStorage.getItem(k)}catch(e){return null}}
 async function kvSet(k,v){try{if(N.isNative)await N.Preferences.set({key:k,value:v});else localStorage.setItem(k,v);return true}catch(e){return false}}
-async function persist(){const ok=await kvSet(DATA_KEY,JSON.stringify({app:"executive-desk",version:1,saved:new Date().toISOString(),data:store}));if(!ok)flash("Could not save to the phone's storage.");scheduleReminders();return ok}
+async function persist(){
+  if(mode==="cloud"){scheduleReminders();return true}
+  const ok=await kvSet(DATA_KEY,JSON.stringify({app:"executive-desk",version:1,saved:new Date().toISOString(),data:store}));if(!ok)flash("Could not save to this "+DEVICE+"'s storage.");scheduleReminders();return ok}
 async function saveSettings(){await kvSet(SET_KEY,JSON.stringify(settings));scheduleReminders()}
 const newId=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,8);
+const COLLS=()=>Object.keys(store);
+const syncErr=e=>{console.warn(e);flash(e&&e.code==="permission-denied"?"The online database refused this change. Check the database rules.":"A change could not be uploaded yet. It is kept on this "+DEVICE+".")};
 
 async function boot(){
   renderNav();render();
-  try{const raw=await kvGet(DATA_KEY);if(raw){const d=JSON.parse(raw).data||{};Object.keys(store).forEach(k=>{if(Array.isArray(d[k]))store[k]=d[k]})}}catch(e){flash("Saved data could not be read.")}
+  try{const raw=await kvGet(DATA_KEY);if(raw){localData=JSON.parse(raw).data||{};Object.keys(store).forEach(k=>{if(Array.isArray(localData[k]))store[k]=localData[k]})}}catch(e){flash("Saved data could not be read.")}
   try{const s=await kvGet(SET_KEY);if(s)settings={...settings,...JSON.parse(s)}}catch(e){}
-  loaded=true;render();
+  const localOnly=(await kvGet(LOCAL_ONLY_KEY))==="1";
+  if(S.enabled&&!localOnly){
+    cloudWired=true;S.onStatus(s=>{syncState=s;const el=$("#syncState");if(el)el.innerHTML=syncBadge();if(view==="settings")refreshSettingsStatus()});
+    S.onAuth(u=>{cloudUser=u;if(u)startCloud();else{mode="signin";loaded=true;render()}});
+  }else{loaded=true;render()}
   if(N.isNative){
     N.App.addListener("backButton",()=>{if(editing||editingAction){editing=null;editingAction=null;render()}else if(view!=="overview")go("overview");else N.App.exitApp()});
     N.LocalNotifications.addListener("localNotificationActionPerformed",e=>{const v=e?.notification?.extra?.view;if(v)go(v)});
     N.App.addListener("resume",()=>render());
   }
+  if(N.isDesktop)startDesktopReminders();
   scheduleReminders();
+}
+function startCloud(){
+  mode="cloud";loaded=false;COLLS().forEach(k=>store[k]=[]);render();
+  const seen=new Set();
+  S.subscribe(COLLS(),(name,recs)=>{store[name]=recs;seen.add(name);
+    if(!loaded&&seen.size===COLLS().length){loaded=true;migrateLocal()}
+    if(loaded){scheduleReminders();if(!document.activeElement||!document.activeElement.closest(".panel"))render();else{renderNav();refreshLists()}}
+  },(name,e)=>{loaded=true;render();flash(e&&e.code==="permission-denied"?"This account is not allowed to read the online records.":"Could not read records: "+(e&&e.message||e))});
+}
+// First sign-in on a device that already holds records: upload any the cloud doesn't have yet.
+async function migrateLocal(){
+  if(!localData||!cloudUser)return;const flag="eadesk.migrated."+cloudUser.uid;if((await kvGet(flag))==="1")return;
+  const items=[];COLLS().forEach(k=>(localData[k]||[]).forEach(r=>{if(r&&r._id&&!store[k].some(x=>x._id===r._id))items.push({name:k,id:r._id,obj:r})}));
+  await kvSet(flag,"1");
+  if(items.length){S.putMany(items).catch(syncErr);flash(`Added ${items.length} record${items.length>1?"s":""} from this ${DEVICE} to the online desk.`)}
 }
 async function save(coll,obj,id){
   const clean={};Object.entries(obj).forEach(([k,v])=>{if(!k.startsWith("_"))clean[k]=v});
   clean.updated=new Date().toISOString();
   if(id){const i=store[coll].findIndex(r=>r._id===id);if(i<0)return false;clean.created=store[coll][i].created||clean.updated;store[coll][i]={...clean,_id:id}}
-  else{clean.created=clean.updated;store[coll].push({...clean,_id:newId()})}
+  else{clean.created=clean.updated;id=newId();store[coll].push({...clean,_id:id})}
+  if(mode==="cloud")S.set(coll,id,clean).catch(syncErr);
   const ok=await persist();render();return ok;
 }
 async function remove(coll,id){
   store[coll]=store[coll].filter(r=>r._id!==id);
-  if(coll==="meetings")store.actions.forEach(a=>{if(a.meeting===id)a.meeting=""});
+  const touched=[];if(coll==="meetings")store.actions.forEach(a=>{if(a.meeting===id){a.meeting="";touched.push(a)}});
+  if(mode==="cloud"){S.remove(coll,id).catch(syncErr);touched.forEach(a=>S.set("actions",a._id,a).catch(syncErr))}
   await persist();render();
 }
+function syncBadge(){
+  if(mode!=="cloud")return S.enabled?`<span class="pill">On this ${DEVICE} only</span>`:"";
+  if(!syncState.online)return`<span class="pill warn" title="Changes are kept on this ${DEVICE} and upload when back online">Offline${syncState.pending?" · changes waiting":""}</span>`;
+  return syncState.pending?`<span class="pill info">Syncing…</span>`:`<span class="pill ok">Synced</span>`;
+}
+function signInHTML(){
+  return `<div class="top"><div><div class="eyebrow">Executive Desk</div><h1>Sign in</h1><p class="lede">Sign in with your desk account so this ${DEVICE} shares the same records as your other devices. Records stay available offline.</p></div></div>
+  <section class="panel" style="max-width:460px"><div class="form" style="grid-template-columns:1fr">
+   <label>Email<input id="siEmail" type="email" autocomplete="username" inputmode="email"></label>
+   <label>Password<input id="siPw" type="password" autocomplete="current-password"></label></div>
+   <div class="formbar"><button class="btn primary" id="siGo">Sign in</button><button class="btn ghost" id="siReset">Forgot password</button><span class="msg" id="siMsg"></span></div></section>
+  <p class="small" style="max-width:460px">No internet right now, or no account yet? <button class="btn sm ghost" id="siLocal">Use on this ${DEVICE} only</button><br>You can sign in later from Settings &amp; sync; records kept on this ${DEVICE} are then added to the online desk.</p>`;
+}
+function wireSignIn(){
+  const msg=t=>$("#siMsg").textContent=t;
+  $("#siGo").onclick=async()=>{const e=$("#siEmail").value.trim(),p=$("#siPw").value;if(!e||!p)return msg("Enter your email and password.");
+    $("#siGo").disabled=true;msg("Signing in…");
+    try{await S.signIn(e,p)}catch(err){$("#siGo").disabled=false;const c=err&&err.code||"";
+      msg(/invalid-credential|wrong-password|user-not-found|invalid-email/.test(c)?"Email or password is not correct.":/network/.test(c)?"No internet connection. Connect and try again.":/too-many/.test(c)?"Too many attempts. Wait a few minutes.":"Could not sign in ("+c+").")}};
+  $("#siPw").onkeydown=e=>{if(e.key==="Enter")$("#siGo").click()};
+  $("#siReset").onclick=async()=>{const e=$("#siEmail").value.trim();if(!e)return msg("Type your email first.");try{await S.resetPassword(e);msg("A reset link was sent to "+e+".")}catch(err){msg("Could not send the reset email.")}};
+  $("#siLocal").onclick=async()=>{await kvSet(LOCAL_ONLY_KEY,"1");mode="local";loaded=true;Object.keys(store).forEach(k=>store[k]=Array.isArray(localData?.[k])?localData[k]:[]);render()};
+}
+let cloudWired=false;
+async function enableCloud(){ // from Settings, after choosing "this device only"
+  await kvSet(LOCAL_ONLY_KEY,"0");localData=JSON.parse(JSON.stringify(store));
+  if(cloudWired){mode="signin";render();return}
+  cloudWired=true;S.onStatus(st=>{syncState=st;const el=$("#syncState");if(el)el.innerHTML=syncBadge()});
+  S.onAuth(u=>{cloudUser=u;if(u)startCloud();else{mode="signin";loaded=true;render()}});
+}
+async function doSignOut(){
+  if(!(await ask("Sign out on this "+DEVICE+"? Records stay safe online; sign in again to see them.")))return;
+  await S.signOut();mode="signin";COLLS().forEach(k=>store[k]=[]);scheduleReminders();render();
+}
+async function ask(text){if(N.isDesktop){try{return await N.Desktop.dialog.ask(text,{title:"Executive Desk",kind:"warning"})}catch(e){}}return confirm(text)}
 let flashMsg="",flashT=null;function flash(m){flashMsg=m;let el=document.querySelector(".toast");if(!el){el=document.createElement("div");el.className="toast";el.setAttribute("role","status");document.body.appendChild(el)}el.textContent=m;el.hidden=false;clearTimeout(flashT);flashT=setTimeout(()=>{el.hidden=true;flashMsg=""},3500)}
 
 /* ---------- rendering ---------- */
@@ -221,9 +286,10 @@ function badgeFor(t){const rs=store[t.id];if(t.id==="diary"){t.prep(rs);return r
   if(t.id==="meetings")return store.actions.filter(a=>a.status!=="Done"&&a.due&&a.due<todayISO()).length;
   return t.flag?rs.filter(t.flag).length:0}
 function renderNav(){
+  const ss=$("#syncState");if(ss)ss.innerHTML=syncBadge();
   const nav=$("#nav");
   nav.innerHTML=`<button data-v="overview" aria-current="${view==="overview"}"><span class="ico">◆</span>Overview</button><button data-v="timeline" aria-current="${view==="timeline"}"><span class="ico">▤</span>Timeline${(()=>{const n=timelineItems().filter(i=>i.cls==="bad").length;return n?`<span class="badge" title="Overdue">${n}</span>`:""})()}</button><div class="sep"></div>`+
-   TOOLS.map(t=>{const b=badgeFor(t);return`<button data-v="${t.id}" aria-current="${view===t.id}"><span class="num">${t.num}</span><span>${esc(t.nav)}</span>${b?`<span class="badge" title="Needs attention">${b}</span>`:""}</button>`}).join("")+`<div class="sep"></div><button data-v="settings" aria-current="${view==="settings"}"><span class="ico">⚙</span>Reminders & backup${backupDue()?`<span class="badge" title="Backup due">!</span>`:""}</button>`;
+   TOOLS.map(t=>{const b=badgeFor(t);return`<button data-v="${t.id}" aria-current="${view===t.id}"><span class="num">${t.num}</span><span>${esc(t.nav)}</span>${b?`<span class="badge" title="Needs attention">${b}</span>`:""}</button>`}).join("")+`<div class="sep"></div><button data-v="settings" aria-current="${view==="settings"}"><span class="ico">⚙</span>Settings & sync${backupDue()?`<span class="badge" title="Backup due">!</span>`:""}</button>`;
   nav.querySelectorAll("button").forEach(b=>b.onclick=()=>go(b.dataset.v));
 }
 function go(v){view=v;editing=null;editingAction=null;confirmDel=null;filters.q="";try{localStorage.setItem("eadesk.view",v)}catch(e){}renderNav();render();window.scrollTo(0,0)}
@@ -231,6 +297,8 @@ function go(v){view=v;editing=null;editingAction=null;confirmDel=null;filters.q=
 function render(){
   renderNav();
   const m=$("#main");
+  document.body.classList.toggle("signin",mode==="signin");
+  if(mode==="signin"){m.innerHTML=signInHTML();wireSignIn();return}
   if(view==="overview"){m.innerHTML=overviewHTML();m.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));return}
   if(view==="timeline"){m.innerHTML=timelineHTML();wireTimeline();return}
   if(view==="settings"){m.innerHTML=settingsHTML();wireSettings();return}
@@ -239,7 +307,8 @@ function render(){
 function refreshLists(){const t=TOOLS.find(x=>x.id===view);if(!t)return;const w=$("#listwrap");if(w){w.innerHTML=listHTML(t);wireList(t)}const c=$("#chips");if(c)c.innerHTML=chipsHTML(t)}
 
 function notices(){let h="";
-  if(loaded&&!N.isNative)h+=`<div class="notice">Preview mode: records are saved in this browser only. Install the Android app for reminders and phone storage.</div>`;
+  if(loaded&&N.platform==="web"&&mode!=="cloud")h+=`<div class="notice">Preview mode: records are saved in this browser only. Install the Android or Windows app for reminders.</div>`;
+  if(mode==="cloud"&&!syncState.online)h+=`<div class="notice warn">You are offline. Changes are saved on this ${DEVICE} and will upload automatically when the internet is back.</div>`;
   if(loaded&&backupDue()&&view==="overview")h+=`<div class="notice warn">Your last backup was ${settings.lastBackup?esc(fmtD(settings.lastBackup.slice(0,10))):"never made"}. <button class="btn sm" data-go="settings">Back up now</button></div>`;
   return h}
 
@@ -363,6 +432,11 @@ async function exportFile(name,text,mime){
       await N.Share.share({title:name,dialogTitle:"Save or send "+name,files:[w.uri]});return true}
     catch(e){if(!/cancel/i.test(String(e&&e.message)))flash("The file could not be shared.");return false}
   }
+  if(N.isDesktop){
+    try{const ext=name.split(".").pop();const path=await N.Desktop.dialog.save({defaultPath:name,filters:[{name:ext.toUpperCase()+" file",extensions:[ext]}]});
+      if(!path)return false;await N.Desktop.saveText(path,text);flash("Saved to "+path);return true}
+    catch(e){flash("The file could not be saved.");return false}
+  }
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([text],{type:mime}));a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);return true;
 }
 const recordCount=()=>Object.values(store).reduce((s,a)=>s+a.length,0);
@@ -375,7 +449,12 @@ async function doBackup(){
 function startRestore(){const f=$("#restoreFile");f.value="";f.onchange=async()=>{const file=f.files[0];if(!file)return;
   try{const j=JSON.parse(await file.text());if(j.app!=="executive-desk"||!j.data)throw 0;
     const n=Object.values(j.data).reduce((s,a)=>s+(Array.isArray(a)?a.length:0),0);
-    if(!confirm(`Replace ALL records on this phone with the backup from ${fmtD(String(j.saved||"").slice(0,10))} (${n} records)?\n\nRecords added since that backup will be lost.`))return;
+    const where=mode==="cloud"?"the online desk (all your devices)":"this "+DEVICE;
+    if(!(await ask(`Replace ALL records on ${where} with the backup from ${fmtD(String(j.saved||"").slice(0,10))} (${n} records)?\n\nRecords added since that backup will be lost.`)))return;
+    if(mode==="cloud"){
+      const items=[];COLLS().forEach(k=>{const keep=new Set((j.data[k]||[]).map(r=>r._id));store[k].forEach(r=>{if(!keep.has(r._id))items.push({name:k,id:r._id,del:true})});(j.data[k]||[]).forEach(r=>{if(r&&r._id)items.push({name:k,id:r._id,obj:r})})});
+      S.putMany(items).catch(syncErr);
+    }
     Object.keys(store).forEach(k=>store[k]=Array.isArray(j.data[k])?j.data[k]:[]);
     await persist();flash(`Restored ${n} records.`);go("overview");
   }catch(e){flash("That file is not an Executive Desk backup.")}};f.click()}
@@ -440,27 +519,29 @@ function wireTimeline(){
   const tlEl=$(".tl"),today=$(".tltoday.lbl");if(tlEl&&today){const x=today.getBoundingClientRect().left-tlEl.getBoundingClientRect().left;const lw=$(".tlrow.head .tllab").offsetWidth;const want=x-lw-(tlEl.clientWidth-lw)*0.3;if(want>0)tlEl.scrollLeft=want}
 }
 
-/* ---------- reminders (Android local notifications) ---------- */
+/* ---------- reminders: Android (scheduled by the phone) and Windows (fired by the running app) ---------- */
 let remTimer=null,remCount=0,permState="unknown",exactState="unknown";
 function hashId(str){let h=7;for(const c of str)h=(h*31+c.charCodeAt(0))|0;return Math.abs(h)%2000000000+1}
 function atLocal(iso,hhmm){const[h,m]=(hhmm||`${settings.hour}:00`).split(":").map(Number);const d=new Date(iso+"T00:00:00");d.setHours(h,m||0,0,0);return d}
-function buildReminders(){
-  const now=new Date(),limit=new Date(Date.now()+90*864e5),list=[],hh=String(settings.hour).padStart(2,"0")+":00";
-  const add=(key,when,title,body,v)=>{if(when>now&&when<limit)list.push({id:hashId(key),title,body,schedule:{at:when,allowWhileIdle:true},channelId:"desk",smallIcon:"ic_stat_desk",extra:{view:v}})};
+function buildReminders(pastHours=0){
+  const from=new Date(Date.now()-pastHours*36e5),limit=new Date(Date.now()+90*864e5),list=[],hh=String(settings.hour).padStart(2,"0")+":00";
+  const add=(key,when,title,body,v)=>{if(when>from&&when<limit)list.push({id:hashId(key),title,body,schedule:{at:when,allowWhileIdle:true},channelId:"desk",smallIcon:"ic_stat_desk",extra:{view:v}})};
   const db=Number(settings.daysBefore)||0;
   timelineItems().filter(i=>!i.done).forEach(i=>{
     const v=i.area==="actions"?"meetings":i.area,lab=AREA[i.area].replace(/s$/,"");
-    if(i.time&&(i.area==="meetings"||i.area==="diary")){const at=atLocal(i.end,i.time);add(i.id+"t",new Date(at-settings.minutesBefore*6e4),`${lab} at ${i.time}`,i.title+(i.sub?" · "+i.sub:""),v)}
+    if(i.time&&(i.area==="meetings"||i.area==="diary")){const at=atLocal(i.end,i.time);add(i.id+"t"+i.end+i.time,new Date(at-settings.minutesBefore*6e4),`${lab} at ${i.time}`,i.title+(i.sub?" · "+i.sub:""),v)}
     if(i.area==="diary"||i.area==="social")return;
     const verb=i.area==="travel"?"departs":i.area==="meetings"?"is on":"is due";
-    if(db>0)add(i.id+"b",atLocal(addDays(i.end===i.start||i.area!=="travel"?i.end:i.start,-db),hh),`${lab} ${verb} in ${db} day${db>1?"s":""}`,i.title,v);
-    add(i.id+"d",atLocal(i.area==="travel"?i.start:i.end,hh),`${lab} ${verb} today`,i.title,v);
+    const day=i.area==="travel"?i.start:i.end;
+    if(db>0)add(i.id+"b"+day+db,atLocal(addDays(day,-db),hh),`${lab} ${verb} in ${db} day${db>1?"s":""}`,i.title,v);
+    add(i.id+"d"+day,atLocal(day,hh),`${lab} ${verb} today`,i.title,v);
   });
-  if(recordCount()&&settings.backupEvery){const base=settings.lastBackup?d10(settings.lastBackup):todayISO();let due=addDays(base,settings.backupEvery);if(due<todayISO())due=addDays(todayISO(),1);add("backup"+due,atLocal(due,hh),"Time to back up your desk","Open Reminders & backup and tap “Back up now”.","settings")}
-  return list.sort((a,b)=>a.schedule.at-b.schedule.at).slice(0,60);
+  if(recordCount()&&settings.backupEvery){const base=settings.lastBackup?d10(settings.lastBackup):todayISO();let due=addDays(base,settings.backupEvery);if(due<todayISO())due=addDays(todayISO(),1);add("backup"+due,atLocal(due,hh),"Time to back up your desk","Open Settings & sync and tap “Back up now”.","settings")}
+  return list.sort((a,b)=>a.schedule.at-b.schedule.at).slice(0,pastHours?400:60);
 }
 function scheduleReminders(){clearTimeout(remTimer);remTimer=setTimeout(doSchedule,400)}
 async function doSchedule(){
+  if(N.isDesktop){remCount=settings.remind?buildReminders().length:0;if(view==="settings")refreshSettingsStatus();return}
   if(!N.isNative)return;const LN=N.LocalNotifications;
   try{
     const pend=await LN.getPending();if(pend.notifications.length)await LN.cancel({notifications:pend.notifications.map(n=>({id:n.id}))});
@@ -471,33 +552,59 @@ async function doSchedule(){
     const list=buildReminders();if(list.length)await LN.schedule({notifications:list});remCount=list.length;
   }catch(e){console.warn(e)}finally{if(view==="settings")refreshSettingsStatus()}
 }
+// Windows: the app keeps running in the system tray and checks every 30 seconds. Reminders missed while the
+// computer was off are shown when it starts, if they are less than 12 hours old.
+const FIRED_KEY="eadesk.fired";
+async function desktopNotify(title,body){
+  const n=N.Desktop.notify;try{let ok=await n.isPermissionGranted();if(!ok)ok=(await n.requestPermission())==="granted";permState=ok?"granted":"denied";if(ok)n.sendNotification({title,body});return ok}catch(e){console.warn(e);return false}
+}
+function startDesktopReminders(){
+  const tick=async()=>{
+    if(!settings.remind||!loaded||mode==="signin")return;
+    let fired={};try{fired=JSON.parse(localStorage.getItem(FIRED_KEY)||"{}")}catch(e){}
+    const now=Date.now();
+    for(const r of buildReminders(12)){if(r.schedule.at.getTime()<=now&&!fired[r.id]){fired[r.id]=now;await desktopNotify(r.title,r.body)}}
+    Object.keys(fired).forEach(k=>{if(now-fired[k]>3*864e5)delete fired[k]});
+    try{localStorage.setItem(FIRED_KEY,JSON.stringify(fired))}catch(e){}
+  };
+  setTimeout(tick,8000);setInterval(tick,30000);
+}
 
 /* ---------- settings view ---------- */
 function settingsHTML(){
   const opt=(v,cur,l)=>`<option value="${v}"${String(cur)===String(v)?" selected":""}>${l}</option>`;
-  return `${notices()}<div class="top"><div><div class="eyebrow">This phone</div><h1>Reminders & backup</h1><p class="lede">All records live on this phone only. Reminders come from the phone itself, so they work without internet.</p></div></div>
+  const syncPanel=!S.enabled?`<section class="panel"><h2>Sync</h2><p class="small">Sync is not set up in this version. Records stay on this ${DEVICE}.</p></section>`
+   :mode==="cloud"?`<section class="panel"><h2>Sync</h2><p class="small">Signed in as <b>${esc(cloudUser?.email||"")}</b>. Records are shared with your other devices and kept on this ${DEVICE} for offline use.</p>
+     <p class="small" id="syncLine"></p><div class="row2"><button class="btn ghost" id="sOut">Sign out</button></div></section>`
+   :`<section class="panel"><h2>Sync</h2><p class="small">This ${DEVICE} is not signed in, so its records are not shared with your other devices.</p><div class="row2"><button class="btn primary" id="sIn">Sign in to sync</button></div></section>`;
+  const remNote=N.isDesktop?`<label class="switch" style="margin-top:12px"><input type="checkbox" id="sAuto"> Start Executive Desk when Windows starts (needed for reminders)</label><p class="small">Closing the window keeps the desk running in the system tray (by the clock) so reminders still appear. To quit fully, right-click the tray icon and choose Quit.</p>`:"";
+  return `${notices()}<div class="top"><div><div class="eyebrow">This ${DEVICE}</div><h1>Settings & sync</h1><p class="lede">Sync, reminders and backups for this ${DEVICE}. Reminder settings apply to this ${DEVICE} only.</p></div></div>
   <div class="setgrid">
+  ${syncPanel}
   <section class="panel"><h2>Reminders</h2>
    <label class="switch"><input type="checkbox" id="sRemind"${settings.remind?" checked":""}> Remind me about due dates, meetings and trips</label>
    <div class="form" style="margin-top:12px">
     <label>Early reminder<select id="sDays">${[0,1,2,3,7].map(d=>opt(d,settings.daysBefore,d?`${d} day${d>1?"s":""} before`:"None (only on the day)")).join("")}</select></label>
     <label>Reminder time<select id="sHour">${[6,7,8,9,10,12,14,17].map(h=>opt(h,settings.hour,String(h).padStart(2,"0")+":00")).join("")}</select></label>
     <label>Meetings and diary<select id="sMins">${[10,15,30,60,120].map(m=>opt(m,settings.minutesBefore,(m<60?m+" minutes":m/60+" hour"+(m>60?"s":""))+" before")).join("")}</select></label>
-   </div>
+   </div>${remNote}
    <p class="small" id="remStatus" style="margin-top:12px"></p>
    <div class="row2"><button class="btn" id="sTest">Send a test reminder</button><button class="btn ghost" id="sExact" hidden>Allow on-time alarms</button></div>
   </section>
   <section class="panel"><h2>Backup & restore</h2>
-   <p class="small">Last backup: <b>${settings.lastBackup?esc(fmtD(d10(settings.lastBackup))):"never"}</b> · ${recordCount()} records on this phone.</p>
-   <p class="small">“Back up now” makes one file holding every record. Save it to Google Drive, email it to yourself, or keep it on a computer. If the phone is lost or replaced, install the app again and use “Restore from file”.</p>
+   <p class="small">Last backup: <b>${settings.lastBackup?esc(fmtD(d10(settings.lastBackup))):"never"}</b> · ${recordCount()} records.</p>
+   <p class="small">“Back up now” makes one file holding every record, a safety copy that does not depend on the internet or the online account. Keep it on Google Drive, in email or on a USB stick.</p>
    <div class="row2" style="margin-top:8px"><button class="btn primary" id="sBackup">Back up now</button><button class="btn" id="sRestore">Restore from file</button></div>
    <div class="form" style="margin-top:14px"><label>Remind me to back up<select id="sEvery">${[[0,"Never"],[1,"Every day"],[7,"Every week"],[14,"Every 2 weeks"],[30,"Every month"]].map(([v,l])=>opt(v,settings.backupEvery,l)).join("")}</select></label></div>
   </section>
-  <section class="panel"><h2>About</h2><p class="small">Executive Desk 1.0 for Android · Office of the MD, CEMMATS. Nothing is sent to the internet; records stay on this phone until you share a backup or CSV file.</p></section>
+  <section class="panel"><h2>About</h2><p class="small">Executive Desk 2.0 for ${N.platform==="windows"?"Windows":N.platform==="android"?"Android":"the web"} · Office of the MD, CEMMATS. ${mode==="cloud"?"Records are stored in the desk's private Firebase database (Google) and on this "+DEVICE+"; only the signed-in account can read them.":"Records are stored on this "+DEVICE+" only."}</p></section>
   </div>`;
 }
-function refreshSettingsStatus(){const el=$("#remStatus");if(!el)return;
-  el.textContent=!N.isNative?"Reminders work in the Android app only.":!settings.remind?"Reminders are switched off.":permState==="denied"?"Notifications are blocked for this app. Turn them on in Android Settings → Apps → Executive Desk → Notifications.":`${remCount} reminder${remCount===1?"":"s"} scheduled for the next 90 days.`+(exactState==="denied"?" Android may deliver them a few minutes late; tap “Allow on-time alarms” to fix this.":"");
+function refreshSettingsStatus(){
+  const sl=$("#syncLine");if(sl)sl.innerHTML=`Status: ${syncBadge()}`;
+  const el=$("#remStatus");if(!el)return;
+  if(N.isDesktop)el.textContent=!settings.remind?"Reminders are switched off.":permState==="denied"?"Windows is blocking notifications for this app. Turn them on in Windows Settings → System → Notifications.":`${remCount} reminder${remCount===1?"":"s"} coming up in the next 90 days.`;
+  else el.textContent=!N.isNative?"Reminders work in the Android and Windows apps.":!settings.remind?"Reminders are switched off.":permState==="denied"?"Notifications are blocked for this app. Turn them on in Android Settings → Apps → Executive Desk → Notifications.":`${remCount} reminder${remCount===1?"":"s"} scheduled for the next 90 days.`+(exactState==="denied"?" Android may deliver them a few minutes late; tap “Allow on-time alarms” to fix this.":"");
   const ex=$("#sExact");if(ex)ex.hidden=!(N.isNative&&exactState==="denied")}
 function wireSettings(){
   const upd=async(k,v)=>{settings[k]=v;await saveSettings()};
@@ -505,12 +612,17 @@ function wireSettings(){
   $("#sHour").onchange=e=>upd("hour",Number(e.target.value));$("#sMins").onchange=e=>upd("minutesBefore",Number(e.target.value));
   $("#sEvery").onchange=e=>upd("backupEvery",Number(e.target.value));
   $("#sBackup").onclick=doBackup;$("#sRestore").onclick=startRestore;
+  $("#sOut")&&($("#sOut").onclick=doSignOut);$("#sIn")&&($("#sIn").onclick=enableCloud);
+  if(N.isDesktop){const a=N.Desktop.autostart,cb=$("#sAuto");a.isEnabled().then(v=>cb.checked=v).catch(()=>{});
+    cb.onchange=async()=>{try{cb.checked?await a.enable():await a.disable()}catch(e){flash("Could not change the start-up setting.")}}}
   $("#sExact").onclick=async()=>{try{await N.LocalNotifications.changeExactNotificationSetting()}catch(e){}scheduleReminders()};
-  $("#sTest").onclick=async()=>{if(!N.isNative){flash("Reminders work in the Android app only.");return}
+  $("#sTest").onclick=async()=>{
+    if(N.isDesktop){flash("A test reminder will appear in 5 seconds.");setTimeout(async()=>{if(!(await desktopNotify("Executive Desk","Reminders are working.")))flash("Windows is blocking notifications for this app.");refreshSettingsStatus()},5000);return}
+    if(!N.isNative){flash("Reminders work in the Android and Windows apps.");return}
     try{let p=await N.LocalNotifications.requestPermissions();if(p.display!=="granted"){flash("Notifications are blocked for this app.");return}
       await N.LocalNotifications.createChannel({id:"desk",name:"Desk reminders",importance:4,visibility:0,vibration:true});
       await N.LocalNotifications.schedule({notifications:[{id:999,title:"Executive Desk",body:"Reminders are working.",channelId:"desk",smallIcon:"ic_stat_desk",schedule:{at:new Date(Date.now()+5000),allowWhileIdle:true}}]});flash("A test reminder will appear in 5 seconds.")}catch(e){flash("The test reminder could not be set.")}};
-  refreshSettingsStatus();if(N.isNative)doSchedule();
+  refreshSettingsStatus();doSchedule();
 }
 
 boot();

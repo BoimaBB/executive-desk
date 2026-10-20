@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "Lorna's Executive Desk - offline Android app",
   "scripts": {
-    "bundle": "esbuild src/native.js --bundle --minify --format=iife --target=chrome89 --outfile=www/native.js",
+    "bundle": "esbuild src/bridge.js --bundle --minify --format=iife --target=chrome89 --outfile=www/native.js",
     "build": "npm run bundle && cap sync android",
-    "icons": "python3 resources/make_icons.py"
+    "icons": "python3 resources/make_icons.py",
+    "build:web": "npm run bundle"
   },
   "author": "",
   "license": "ISC",
@@ -19,10 +20,16 @@
     "@capacitor/share": "^8.0.3",
     "@fontsource/ibm-plex-mono": "^5.3.0",
     "@fontsource/public-sans": "^5.3.0",
-    "@fontsource/sora": "^5.3.0"
+    "@fontsource/sora": "^5.3.0",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-autostart": "^2.7.0",
+    "@tauri-apps/plugin-dialog": "^2.8.3",
+    "@tauri-apps/plugin-notification": "^2.7.0",
+    "firebase": "^13.0.0"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.3",
+    "@tauri-apps/cli": "^2.12.3",
     "esbuild": "^0.28.2"
   },
   "private": true
